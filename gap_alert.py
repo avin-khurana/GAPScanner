@@ -3,6 +3,7 @@
 Gap Alert v1.0
 Scans top 50 US stocks (market cap >$100B) for today's gap.
   Gap-down > 4%  OR  Gap-up > 1.5%  → email alert with top 3 news per stock.
+  Scans last 3 trading days by default.
 Schedule: 4 PM CST (22:00 UTC) on weekdays via GitHub Actions.
 
 Gap definition (High/Low based):
@@ -25,6 +26,7 @@ DOWN_THRESHOLD = 4.0    # gap-down must exceed this %
 UP_THRESHOLD   = 1.5    # gap-up must exceed this %
 MIN_MARKET_CAP = 100e9  # $100 billion
 TOP_N          = 50
+LOOKBACK_DAYS  = 3      # number of recent trading days to scan for gaps
 
 # ── Email (override via env vars / GitHub Secrets) ───────────────────────────
 EMAIL_FROM     = os.environ.get('EMAIL_FROM', '')
@@ -102,63 +104,68 @@ def build_universe():
     return universe, cap_map
 
 
-# ── Step 2: Detect today's gap ───────────────────────────────────────────────
+# ── Step 2: Detect gaps over last LOOKBACK_DAYS trading days ─────────────────
 
-def detect_today_gap(ticker):
+def detect_recent_gaps(ticker):
     """
-    Downloads last 5 trading days and checks the final two rows.
+    Downloads last 10 trading days and scans the final LOOKBACK_DAYS rows.
     Uses High/Low definition (same as gap_scanner.py).
-    Returns a gap dict or None.
+    Returns a list of gap dicts (may be empty).
     """
+    gaps = []
     try:
-        df = yf.download(ticker, period='5d', auto_adjust=True, progress=False)
+        df = yf.download(ticker, period='10d', auto_adjust=True, progress=False)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         if len(df) < 2:
-            return None
+            return gaps
 
-        prev = df.iloc[-2]
-        curr = df.iloc[-1]
+        # Only scan the last LOOKBACK_DAYS rows (each needs a previous row)
+        scan_rows = df.iloc[-(LOOKBACK_DAYS + 1):]
 
-        prev_low  = float(prev['Low'])
-        prev_high = float(prev['High'])
-        curr_low  = float(curr['Low'])
-        curr_high = float(curr['High'])
+        for i in range(1, len(scan_rows)):
+            prev = scan_rows.iloc[i - 1]
+            curr = scan_rows.iloc[i]
 
-        # Gap-down: today's entire range is below yesterday's low
-        if curr_high < prev_low:
-            gap_pct = (prev_low - curr_high) / prev_low * 100
-            if gap_pct > DOWN_THRESHOLD:
-                return dict(
-                    ticker=ticker,
-                    date=df.index[-1].date(),
-                    type='GAP-DOWN',
-                    gap_pct=round(gap_pct, 2),
-                    prev_ref=round(prev_low, 2),
-                    day_ref=round(curr_high, 2),
-                    open=round(float(curr['Open']), 2),
-                    close=round(float(curr['Close']), 2),
-                )
+            prev_low  = float(prev['Low'])
+            prev_high = float(prev['High'])
+            curr_low  = float(curr['Low'])
+            curr_high = float(curr['High'])
 
-        # Gap-up: today's entire range is above yesterday's high
-        elif curr_low > prev_high:
-            gap_pct = (curr_low - prev_high) / prev_high * 100
-            if gap_pct > UP_THRESHOLD:
-                return dict(
-                    ticker=ticker,
-                    date=df.index[-1].date(),
-                    type='GAP-UP',
-                    gap_pct=round(gap_pct, 2),
-                    prev_ref=round(prev_high, 2),
-                    day_ref=round(curr_low, 2),
-                    open=round(float(curr['Open']), 2),
-                    close=round(float(curr['Close']), 2),
-                )
+            # Gap-down: today's entire range is below yesterday's low
+            if curr_high < prev_low:
+                gap_pct = (prev_low - curr_high) / prev_low * 100
+                if gap_pct > DOWN_THRESHOLD:
+                    gaps.append(dict(
+                        ticker=ticker,
+                        date=scan_rows.index[i].date(),
+                        type='GAP-DOWN',
+                        gap_pct=round(gap_pct, 2),
+                        prev_ref=round(prev_low, 2),
+                        day_ref=round(curr_high, 2),
+                        open=round(float(curr['Open']), 2),
+                        close=round(float(curr['Close']), 2),
+                    ))
+
+            # Gap-up: today's entire range is above yesterday's high
+            elif curr_low > prev_high:
+                gap_pct = (curr_low - prev_high) / prev_high * 100
+                if gap_pct > UP_THRESHOLD:
+                    gaps.append(dict(
+                        ticker=ticker,
+                        date=scan_rows.index[i].date(),
+                        type='GAP-UP',
+                        gap_pct=round(gap_pct, 2),
+                        prev_ref=round(prev_high, 2),
+                        day_ref=round(curr_low, 2),
+                        open=round(float(curr['Open']), 2),
+                        close=round(float(curr['Close']), 2),
+                    ))
 
     except Exception as e:
         print(f"    ERROR {ticker}: {e}")
 
-    return None
+    return gaps
 
 
 # ── Step 3: Fetch news ───────────────────────────────────────────────────────
@@ -337,28 +344,34 @@ def main():
     print(f"\n{BAR}")
     print(f"  GAP ALERT SCANNER v1.0  —  {run_date}")
     print(f"  Thresholds:  Gap-Down > {DOWN_THRESHOLD}%  |  Gap-Up > {UP_THRESHOLD}%")
+    print(f"  Lookback:    last {LOOKBACK_DAYS} trading days")
     print(f"  Universe:    top {TOP_N} US stocks with market cap > $100B (dynamic)")
     print(f"{BAR}\n")
 
     # ── 1. Build universe ───────────────────────────────────────────────────
     universe, cap_map = build_universe()
 
-    # ── 2. Scan each ticker for today's gap ─────────────────────────────────
+    # ── 2. Scan each ticker for gaps over last LOOKBACK_DAYS trading days ──────
     print(f"\n{BAR}")
-    print(f"  SCANNING {len(universe)} TICKERS FOR TODAY'S GAP")
+    print(f"  SCANNING {len(universe)} TICKERS — LAST {LOOKBACK_DAYS} TRADING DAYS")
     print(BAR)
 
     gaps = []
     for i, ticker in enumerate(universe):
         print(f"  [{i+1:2d}/{len(universe)}] {ticker:<6} ...", end=" ", flush=True)
-        g = detect_today_gap(ticker)
-        if g:
-            sign = '-' if g['type'] == 'GAP-DOWN' else '+'
-            print(f"*** {g['type']}  {sign}{g['gap_pct']:.2f}% ***")
-            gaps.append(g)
+        found = detect_recent_gaps(ticker)
+        if found:
+            for g in found:
+                sign = '-' if g['type'] == 'GAP-DOWN' else '+'
+                print(f"*** {g['type']} {g['date']} {sign}{g['gap_pct']:.2f}% ***", end=" ")
+            print()
+            gaps.extend(found)
         else:
             print("no gap")
         time.sleep(0.1)
+
+    # Sort by date descending, then gap size
+    gaps.sort(key=lambda x: (x['date'], x['gap_pct']), reverse=True)
 
     # ── 3. Fetch news for qualifying gaps ───────────────────────────────────
     if gaps:
@@ -370,7 +383,7 @@ def main():
 
     # ── 4. Console summary ──────────────────────────────────────────────────
     print(f"\n{BAR}")
-    print(f"  RESULTS: {len(gaps)} qualifying gap(s) of {len(universe)} scanned")
+    print(f"  RESULTS: {len(gaps)} qualifying gap(s) over last {LOOKBACK_DAYS} days / {len(universe)} stocks")
     print(BAR)
     if gaps:
         for g in gaps:
