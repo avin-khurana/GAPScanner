@@ -1,0 +1,40 @@
+name: Gap Alert Scanner
+
+on:
+  schedule:
+    # 22:00 UTC = 4:00 PM CST (UTC-6) | 5:00 PM CDT (UTC-5) — always after market close
+    - cron: '0 22 * * 1-5'
+  workflow_dispatch:   # allows manual run from GitHub Actions UI
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30   # market cap fetch (~110 tickers) + gap scan (~50 tickers)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Gap Alert
+        env:
+          EMAIL_FROM:         ${{ secrets.EMAIL_FROM }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_TO:           avin.khurana18@gmail.com
+        run: python gap_alert.py
+
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gap-alert-${{ github.run_id }}
+          path: gap_alert_*.html
+          retention-days: 30
